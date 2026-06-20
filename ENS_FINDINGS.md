@@ -189,13 +189,30 @@ dynamic fields separately (`keccak256(bytes(name))`, `keccak256(abi.encode(coinT
 
 ---
 
-## Finding #3 — ENSv2 `PermissionedRegistry`: delegated EAC roles survive a name transfer (residual access / resolver hijack after sale)
+## Finding #3 — WITHDRAWN (FALSE POSITIVE: documented intended behavior)
+
+> **Do NOT report.** Verification against `contracts-v2/README.md` shows this is
+> explicitly documented, intended design — not a vulnerability.
+>
+> README "Transfer Behavior": *"Existing roles delegated to other accounts remain
+> intact unless explicitly revoked. Example: If Alice granted Bob ROLE_SET_RESOLVER
+> and transfers the name to Charlie, Charlie becomes the new admin but Bob keeps his
+> resolver permission."* The team also deliberately blocked **admin**-role
+> delegation specifically "to prevent … retaining control after a transfer",
+> while accepting regular-role persistence as a documented tradeoff.
+>
+> The PoC (`poc/ResidualAccessPoC.t.sol`) faithfully demonstrates this behavior,
+> but it is by-design and therefore out of scope / not payable. Kept here only as
+> a record of the (correct) verification that rejected it.
+
+<details>
+<summary>Original (incorrect) write-up — kept for transparency</summary>
 
 | | |
 |---|---|
-| **Severity (self-assessed)** | High (resolution hijack → fund theft; CVE-2020-5232 class) |
-| **Status** | **Confirmed with working Foundry PoC (passes)** |
-| **Repo / scope** | `ensdomains/contracts-v2` (in scope; `PermissionedRegistry` is audit "Key Area of Concern" #2/#3) |
+| **Severity (self-assessed)** | ~~High~~ → **N/A (intended behavior)** |
+| **Status** | PoC passes, but confirmed **false positive** (documented design) |
+| **Repo / scope** | `ensdomains/contracts-v2` |
 | **Component** | `contracts/src/registry/PermissionedRegistry.sol` |
 
 ### Summary
@@ -274,6 +291,8 @@ increment `eacVersionId` in `_update()` so all prior delegatee roles on the old
 resource are abandoned (the new owner is re-granted the registration roles). Or
 explicitly clear all assignees of the resource on transfer. Document the chosen
 behaviour as part of the transfer-safety invariant.
+
+</details>
 
 ---
 
