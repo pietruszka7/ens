@@ -189,6 +189,94 @@ dynamic fields separately (`keccak256(bytes(name))`, `keccak256(abi.encode(coinT
 
 ---
 
+## Finding #3 — ENSv2 `PermissionedRegistry`: delegated EAC roles survive a name transfer (residual access / resolver hijack after sale)
+
+| | |
+|---|---|
+| **Severity (self-assessed)** | High (resolution hijack → fund theft; CVE-2020-5232 class) |
+| **Status** | **Confirmed with working Foundry PoC (passes)** |
+| **Repo / scope** | `ensdomains/contracts-v2` (in scope; `PermissionedRegistry` is audit "Key Area of Concern" #2/#3) |
+| **Component** | `contracts/src/registry/PermissionedRegistry.sol` |
+
+### Summary
+
+When a name (ERC1155 token) is transferred/sold, `_update()` → `_transferRoles()`
+moves only the **previous owner's** roles to the new owner. It does **not**
+increment `eacVersionId`, so the EAC *resource* is unchanged, and any role the
+previous owner delegated to a **third party** (e.g. an alt wallet) on that
+resource **persists after the sale**. The seller therefore keeps `ROLE_SET_RESOLVER`
+/ `ROLE_SET_SUBREGISTRY` control over a name the buyer now owns.
+
+This matches `AUDIT_README.md` "Key Area of Concern #3 — Name transfer safety:
+ensuring ownership state is fully reset on transfer … preventing previous owners
+from retaining access (cf. CVE-2020-5232)", and breaks the documented invariant
+"the token owner is the sole controller of their name."
+
+### Root cause
+
+`eacVersionId` (which forms the EAC resource id) is only bumped in `unregister()`
+and on re-registration of an expired name — **never on transfer**:
+
+```solidity
+function _update(address from, address to, uint256[] memory tokenIds, uint256[] memory amounts) internal override {
+    super._update(from, to, tokenIds, amounts);
+    if (to != address(0) && from != address(0)) {
+        for (uint256 i; i < tokenIds.length; ++i) {
+            uint256 tokenId = tokenIds[i];
+            if (!hasRoles(tokenId, RegistryRolesLib.ROLE_CAN_TRANSFER_ADMIN, from)) {
+                revert TransferDisallowed(tokenId, from);
+            } else if (amounts[i] > 0) {
+                _transferRoles(getResource(tokenId), from, to, false); // only moves `from`'s roles
+            }
+        }
+    }
+}
+```
+
+`_transferRoles` reads `_roles[resource][srcAccount]` only — third-party delegatee
+entries on the same `resource` are never touched, and `resource` does not change.
+
+### Attack
+
+1. Alice registers `premium.eth` (gets `ROLE_SET_RESOLVER` + `ROLE_SET_RESOLVER_ADMIN`
+   + `ROLE_CAN_TRANSFER_ADMIN`, i.e. `ETHRegistrar.REGISTRATION_ROLE_BITMAP`).
+2. Before listing, Alice grants `ROLE_SET_RESOLVER` to her alt wallet `aliceAlt`
+   (allowed because she holds the corresponding admin role).
+3. Alice sells the name to Carol via `safeTransferFrom`.
+4. Carol owns the token and Alice holds no roles — **but `aliceAlt` still holds
+   `ROLE_SET_RESOLVER`** on the (unchanged) resource.
+5. `aliceAlt` calls `setResolver(tokenId, maliciousResolver)`; resolution of
+   Carol's name now points wherever the seller chooses → addresses returned for
+   `premium.eth` can be the seller's, redirecting funds.
+
+The seller cannot reclaim the NFT itself (`ROLE_UNREGISTER` and
+`ROLE_CAN_TRANSFER_ADMIN` are admin-position roles and cannot be delegated), but
+retains full control of the name's resolver and subregistry — i.e. everything
+that determines what the name resolves to.
+
+### Proof of Concept
+
+`poc/ResidualAccessPoC.t.sol` (drop into `contracts/test/unit/registry/` of a built
+`contracts-v2` checkout, then `forge test --match-path test/unit/registry/ResidualAccessPoC.t.sol -vv`):
+
+```
+[PASS] test_PoC_delegatedRoleSurvivesSale_sellerHijacksBuyersResolver()
+```
+
+The test asserts: after the sale Carol owns the token, Alice has no roles, **but
+`aliceAlt` still has `ROLE_SET_RESOLVER`**, and `aliceAlt` successfully rewrites
+the resolver of the name Carol just bought.
+
+### Recommended fix
+
+On transfer, give the name a fresh permission scope just like re-registration —
+increment `eacVersionId` in `_update()` so all prior delegatee roles on the old
+resource are abandoned (the new owner is re-granted the registration roles). Or
+explicitly clear all assignees of the resource on transfer. Document the chosen
+behaviour as part of the transfer-safety invariant.
+
+---
+
 ## ENSv2 (`ensdomains/contracts-v2`) — review notes
 
 In-scope per Immunefi (`contracts-v2/releases`). Reviewed at HEAD `5677359`
