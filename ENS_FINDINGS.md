@@ -187,6 +187,58 @@ dynamic fields separately (`keccak256(bytes(name))`, `keccak256(abi.encode(coinT
 
 ---
 
+---
+
+## ENSv2 (`ensdomains/contracts-v2`) — review notes
+
+In-scope per Immunefi (`contracts-v2/releases`). Reviewed at HEAD `5677359`
+(2026-05-19, pre-release / no tags). Fresh, less-audited code — prioritised.
+
+**Reviewed in depth (no clearly-exploitable Medium+ found):**
+- `EnhancedAccessControl` + `EACBaseRolesLib` — nybble-packed role/count bitmap;
+  carry/borrow overflow & underflow guards (`_hasZeroNybbles`) verified correct;
+  admin-role grant model (`_getSettableRoles`) consistent.
+- `PermissionedRegistry` + `LibLabel` + `ERC1155Singleton` — dual version counters
+  (eac/token); `withVersion` truncates lower 32 bits of the labelhash (cross-name
+  collision needs a 224-bit partial keccak collision → infeasible); token
+  regeneration on role change; role transfer on ERC1155 transfer gated by
+  `ROLE_CAN_TRANSFER_ADMIN`; expired/re-register increments eacVersion → fresh
+  permission scope (old roles orphaned, not leaked).
+- `ETHRegistrar` — commit-reveal binds owner; name goes to committed owner;
+  RESERVED status blocks front-running migration; checked arithmetic on expiry.
+- Migration (`AbstractWrapperReceiver`, `Locked`/`UnlockedMigrationController`,
+  `LockedWrapperReceiver`, `WrapperRegistry`, `LibMigration`) — `node ==
+  namehash(parentNode, keccak(label))` binds label to the transferred token;
+  `onlyWrapper`; you can only migrate names you control in v1.
+- `PermissionedResolver` + `PermissionedResolverLib` — `onlyPartRoles` 2×2
+  resource model; `resolve()`/aliasing/`ResolverProfileRewriterLib` are
+  **read-only** (staticcall, public data) so node-rewrite parser-differentials
+  are not a write-auth bypass.
+- `UserRegistry` — thin self-owned proxy.
+
+**Observations (low / informational, not confirmed payable):**
+1. `PermissionedResolver.multicallWithNodeCheck(node, calls)` ignores `node` and
+   forwards to `multicall(calls)`. In ENSv1 this enforced that every sub-call
+   targets `node` (defence-in-depth when a privileged caller forwards
+   user-supplied data). In v2 it is a no-op. Mitigated because every setter
+   re-checks `onlyPartRoles(node, ...)`, and no in-scope v2 contract forwards
+   attacker data through it — but it is a defence-in-depth regression / footgun
+   for any future integrator that relies on the historical semantics.
+2. All of v2's authorization (`_msgSender()` via `HCAContext`) trusts
+   `HCA_FACTORY.getAccountOwner()`. If the (external, not-in-this-repo) HCA
+   factory can be made to report an attacker-controlled HCA as owned by a victim,
+   it is full impersonation (Critical). The factory implementation should be
+   reviewed separately — it is the single largest trust dependency in v2.
+
+**Not yet reviewed (remaining v2 surface that could still hide a payable bug):**
+`UniversalResolverV2` + `UpgradableUniversalResolverProxy`, the DNS resolvers
+(`DNSTLDResolver`, `DNSAliasResolver`, `DNSTXTResolver`, `DNSTXTParserLib`),
+`AbstractMirrorResolver`/`ENSV1Resolver`/`ENSV2Resolver`, `StandardRentPriceOracle`
++ `LibHalving`, reverse registrars, `LibISO8601`/`LibString`, the `hca/*Upgradeable`
+variants, and `VerifiableFactory` proxy/salt interactions.
+
+---
+
 ## Scope / coverage notes
 
 Reviewed in depth (no Medium+ issue found in these): `ETHRegistrarController`,
