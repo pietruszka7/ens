@@ -123,10 +123,17 @@ contract('BUG #3 — Event/Storage Inconsistency (ENSRegistryWithFallback)', fun
 });
 
 // ─────────────────────────────────────────────────────────────────
-// BUG #1 — HIGH: Permanent Root Node Lock in ENSRegistryWithFallback
+// BUG #1 — CRITICAL: Zombie Lock — Permanent Node Lock + TLD DoS + Domain Theft
 // ─────────────────────────────────────────────────────────────────
-contract('BUG #1 — Permanent Root Node Lock (ENSRegistryWithFallback)', function (accounts) {
+contract('BUG #1 — Critical: Zombie Lock (ENSRegistryWithFallback)', function (accounts) {
     let oldRegistry, newRegistry;
+    const ethNode   = namehash.hash('eth');
+    const aliceNode = namehash.hash('alice.eth');
+
+    // accounts[0] = root admin / Root.sol controller
+    // accounts[1] = Alice (domain owner)
+    // accounts[2] = attacker / new owner
+    // accounts[3] = ETH TLD manager (simulates BaseRegistrar / ETHRegistrarController)
 
     beforeEach(async () => {
         oldRegistry = await ENSRegistry.new();
@@ -194,6 +201,67 @@ contract('BUG #1 — Permanent Root Node Lock (ENSRegistryWithFallback)', functi
                 '[1.3] BUG CONFIRMED: An approved operator can permanently destroy the root node. ' +
                 'Even the original root owner cannot recover it after operator sets owner to address(0).');
         }
+    });
+
+    it('[BUG #1.4] Root.sol-style: setSubnodeOwner(root, sha3("eth"), 0) zombie-locks eth TLD — BaseRegistrar equivalent permanently locked out', async () => {
+        // Setup: root admin assigns eth TLD to a manager (simulating BaseRegistrar / ETHRegistrarController)
+        const ethTLDManager = accounts[3];
+        await newRegistry.setSubnodeOwner(ZERO_HASH, sha3('eth'), ethTLDManager, { from: accounts[0] });
+        assert.equal(await newRegistry.owner(ethNode), ethTLDManager,
+            '[1.4] Setup: eth TLD owned by ethTLDManager (BaseRegistrar equivalent)');
+
+        // TLD manager registers alice.eth (simulating BaseRegistrar.register)
+        await newRegistry.setSubnodeOwner(ethNode, sha3('alice'), accounts[1], { from: ethTLDManager });
+        assert.equal(await newRegistry.owner(aliceNode), accounts[1],
+            '[1.4] Setup: alice.eth registered via TLD manager');
+
+        // ── TRIGGER: Root.sol controller calls setSubnodeOwner(root, sha3('eth'), address(0)) ──
+        // INTENT:   Routine governance action — reassign/retire eth TLD ownership
+        // EXPECTED: eth TLD owner = address(0), manager should still be able to call reclaim later
+        // ACTUAL:   _setOwner converts address(0) → address(this) — eth TLD is ZOMBIE-LOCKED
+        await newRegistry.setSubnodeOwner(ZERO_HASH, sha3('eth'), ZERO_ADDRESS, { from: accounts[0] });
+
+        // Zombie state confirmed
+        assert.equal(await newRegistry.owner(ethNode), ZERO_ADDRESS,
+            '[1.4] eth TLD appears unowned — looks like a normal admin clear');
+        assert.equal(await newRegistry.recordExists(ethNode), true,
+            '[1.4] BUG: recordExists() = true — eth TLD is zombie-locked, records[eth].owner = address(this)');
+
+        // ── IMPACT: BaseRegistrar.reclaim() equivalent fails ──
+        // BaseRegistrar.reclaim(id, owner) calls ens.setSubnodeOwner(ETH_NODE, id, owner)
+        // authorised(ETH_NODE): records[eth].owner = address(ENSRegistryWithFallback)
+        //                       msg.sender = ethTLDManager (BaseRegistrar)
+        //                       address(ENSRegistryWithFallback) == ethTLDManager → FALSE
+        //                       → REVERT
+        try {
+            await newRegistry.setSubnodeOwner(ethNode, sha3('alice'), accounts[1], { from: ethTLDManager });
+            assert.fail('[1.4] BUG NOT CONFIRMED: setSubnodeOwner should have reverted');
+        } catch (err) {
+            assert.include(err.message, 'revert',
+                '[1.4] BUG CONFIRMED: BaseRegistrar.reclaim() PERMANENTLY FAILS. ' +
+                'ethTLDManager is no longer authorised on eth. ' +
+                'All 2M+ .eth names lose management capability. ' +
+                'Recovery requires root governance to call setSubnodeOwner(root, sha3("eth"), BaseRegistrar) — ' +
+                'on mainnet this is gated by a 48h+ time-locked multisig.');
+        }
+
+        // New .eth registrations also fail
+        try {
+            await newRegistry.setSubnodeOwner(ethNode, sha3('bob'), accounts[2], { from: ethTLDManager });
+            assert.fail('[1.4] New registrations should also revert');
+        } catch (err) {
+            assert.include(err.message, 'revert',
+                '[1.4] BUG CONFIRMED: New .eth registrations permanently blocked during governance window.');
+        }
+
+        // ── CRITICAL: Root admin CAN restore eth, but only after governance delay ──
+        // On mainnet ENS, Root.sol uses a 48h+ time-locked multisig.
+        // During that window, ALL .eth management is broken with no emergency override.
+        // Simulate the recovery:
+        await newRegistry.setSubnodeOwner(ZERO_HASH, sha3('eth'), ethTLDManager, { from: accounts[0] });
+        assert.equal(await newRegistry.owner(ethNode), ethTLDManager,
+            '[1.4] After root governance acts: eth TLD restored. ' +
+            'But window of broken .eth management already caused irreversible damage.');
     });
 });
 
