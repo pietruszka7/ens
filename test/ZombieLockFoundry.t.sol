@@ -4,13 +4,13 @@ pragma solidity ^0.7.0;
 import "../contracts/ENSRegistry.sol";
 import "../contracts/ENSRegistryWithFallback.sol";
 
-// Minimal Forge cheatcode interface — works with any Solidity version
+// Minimal Forge cheatcode interface - works with any Solidity version
 interface Vm {
     function startPrank(address sender) external;
     function stopPrank() external;
 }
 
-/// @notice Foundry PoC — ENSRegistryWithFallback._setOwner zombie-lock
+/// @notice Foundry PoC - ENSRegistryWithFallback._setOwner zombie-lock
 ///
 /// Run:   forge test --match-contract ZombieLockTest -vv
 ///
@@ -18,7 +18,7 @@ interface Vm {
 ///             Bug present → test FAILS.
 ///             Bug fixed   → test PASSES.
 contract ZombieLockTest {
-    Vm internal constant vm = Vm(0x7109709ECfa91a80626fF3989D68f67F5b1DD12d);
+    Vm internal constant vm = Vm(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);
 
     ENSRegistry             internal old;
     ENSRegistryWithFallback internal reg;
@@ -65,7 +65,7 @@ contract ZombieLockTest {
 
         require(
             !reg.recordExists(aliceNode),
-            "BUG: owner()==address(0) but recordExists()==true — zombie state"
+            "BUG: owner()==address(0) but recordExists()==true - zombie state"
         );
     }
 
@@ -97,20 +97,20 @@ contract ZombieLockTest {
         // Bug: fallback silenced → returns address(0) instead of RESOLVER_ADDR
         require(
             reg.resolver(bobNode) == RESOLVER_ADDR,
-            "BUG: resolver() returns address(0) — old-registry fallback permanently silenced"
+            "BUG: resolver() returns address(0) - old-registry fallback permanently silenced"
         );
     }
 
     // ── FAIL #3 ──────────────────────────────────────────────────────────────
     // Expected: a victim whose domain was zombie-locked by a malicious operator
-    //           can recover it by calling setOwner(node, self) —
+    //           can recover it by calling setOwner(node, self) -
     //           analogous to what BaseRegistrar.reclaim() achieves for .eth names.
     // Bug:      authorised(aliceNode) reads address(reg) from storage and always
     //           reverts, so ALICE cannot directly reclaim.
     //           The setOwner call reverts → TEST FAILS.
 
     function test_VictimCanDirectlyReclaimAfterOperatorZombies() public {
-        // Alice grants OPERATOR — standard practice (marketplace, manager app)
+        // Alice grants OPERATOR - standard practice (marketplace, manager app)
         vm.startPrank(ALICE);
         reg.setApprovalForAll(OPERATOR, true);
         vm.stopPrank();
@@ -121,7 +121,7 @@ contract ZombieLockTest {
         vm.stopPrank();
 
         // Alice should be able to directly reclaim her domain
-        // Bug: reverts — alice is permanently locked out without ETH_TLD_MGR help
+        // Bug: reverts - alice is permanently locked out without ETH_TLD_MGR help
         vm.startPrank(ALICE);
         reg.setOwner(aliceNode, ALICE);
         vm.stopPrank();
@@ -133,7 +133,7 @@ contract ZombieLockTest {
     //           at minimum setResolver should revert with a clear auth error
     //           and the old resolver value should be readable via fallback.
     // Bug:      zombie lock means even reading the resolver of a migrated node
-    //           returns address(0) instead of the old-registry value — data loss.
+    //           returns address(0) instead of the old-registry value - data loss.
     //           Additionally, the owner can never call setResolver again.
     //           The require below reverts → TEST FAILS.
 
@@ -155,7 +155,7 @@ contract ZombieLockTest {
         // Bug: zombie → fallback silenced → resolver returns address(0) not RESOLVER_ADDR
         require(
             reg.resolver(aliceNode) == RESOLVER_ADDR,
-            "BUG: resolver() returns address(0) — old resolver data permanently lost after renounce"
+            "BUG: resolver() returns address(0) - old resolver data permanently lost after renounce"
         );
     }
 }
