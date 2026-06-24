@@ -7,3 +7,7 @@ _templates
 
 # Compiled contract ABIs and binaries
 build/contracts/*
+
+# Foundry build artifacts
+cache/
+out/
